@@ -1,0 +1,194 @@
+version: "3.9"
+
+networks:
+  app-net:
+    driver: bridge
+
+services:
+  # ---------------------------
+  # POSTGRES
+  # ---------------------------
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    environment:
+      POSTGRES_USER: weather_user
+      POSTGRES_PASSWORD: mysecretpassword
+      POSTGRES_DB: weather_forecast
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - app-net
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U weather_user" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------
+  # KAFKA CLUSTER
+  # ---------------------------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - app-net
+
+  kafka1:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka1
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka1:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    networks:
+      - app-net
+
+  kafka2:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka2
+    depends_on:
+      - zookeeper
+    ports:
+      - "9093:9093"
+    environment:
+      KAFKA_BROKER_ID: 2
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka2:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    networks:
+      - app-net
+
+  kafka3:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka3
+    depends_on:
+      - zookeeper
+    ports:
+      - "9094:9094"
+    environment:
+      KAFKA_BROKER_ID: 3
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka3:9094
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    networks:
+      - app-net
+
+  # ---------------------------
+  # REDIS CLUSTER
+  # ---------------------------
+  redis-node-1:
+    image: redis:7.2
+    container_name: redis-node-1
+    command: [ "redis-server", "--cluster-enabled", "yes", "--cluster-config-file", "nodes.conf", "--cluster-node-timeout", "5000", "--appendonly", "yes" ]
+    ports:
+      - "7000:6379"
+    networks:
+      - app-net
+
+  redis-node-2:
+    image: redis:7.2
+    container_name: redis-node-2
+    command: [ "redis-server", "--cluster-enabled", "yes", "--cluster-config-file", "nodes.conf", "--cluster-node-timeout", "5000", "--appendonly", "yes" ]
+    ports:
+      - "7001:6379"
+    networks:
+      - app-net
+
+  redis-node-3:
+    image: redis:7.2
+    container_name: redis-node-3
+    command: [ "redis-server", "--cluster-enabled", "yes", "--cluster-config-file", "nodes.conf", "--cluster-node-timeout", "5000", "--appendonly", "yes" ]
+    ports:
+      - "7002:6379"
+    networks:
+      - app-net
+
+  redis-cluster-setup:
+    image: redis:7.2
+    container_name: redis-cluster-setup
+    depends_on:
+      - redis-node-1
+      - redis-node-2
+      - redis-node-3
+    entrypoint: >
+      sh -c "
+        sleep 5;
+        echo 'yes' | redis-cli --cluster create \
+          redis-node-1:6379 \
+          redis-node-2:6379 \
+          redis-node-3:6379 \
+          --cluster-replicas 0;
+        tail -f /dev/null
+      "
+    networks:
+      - app-net
+
+  # ---------------------------
+  # NODE APP
+  # ---------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: clusterapi-api
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      POSTGRES_USER: weather_user
+      POSTGRES_PASSWORD: mysecretpassword
+      POSTGRES_DB: weather_forecast
+      POSTGRES_MASTER_HOST: postgres
+      POSTGRES_MASTER_PORT: 5432
+      POSTGRES_SLAVE_HOST: postgres
+      POSTGRES_SLAVE_PORT: 5432
+      REDIS_NODES: redis-node-1:6379,redis-node-2:6379,redis-node-3:6379
+      KAFKA_BROKERS: kafka1:9092,kafka2:9093,kafka3:9094
+      KAFKA_CLIENT_ID: weather-api
+      KAFKA_GROUP_ID: weather-workers
+      KAFKA_TOPIC: weather-requests
+    ports:
+      - "3000:3000"
+    command: sh -c "npx typeorm migration:run --dataSource dist/weather/repositories/data-source.js && npm run dev"
+
+    networks:
+      - app-net
+    depends_on:
+      - postgres
+      - kafka1
+      - kafka2
+      - kafka3
+      - redis-cluster-setup
+
+  worker1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: clusterapi-worker1
+    environment:
+      NODE_ENV: development
+      KAFKA_BROKERS: kafka1:9092,kafka2:9093,kafka3:9094
+      KAFKA_CLIENT_ID: weather-api
+      KAFKA_GROUP_ID: weather-workers
+      KAFKA_TOPIC: weather-requests
+    command: node dist/worker.js
+    networks:
+      - app-net
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
